@@ -3195,7 +3195,7 @@ async def _build_llm_context(
         )
 
     logger.info(
-        f"Final context: {len(entities_context)} entities, {len(relations_context)} relations, {len(text_units_context)} chunks"
+        f"*Final context: {len(entities_context)} entities, {len(relations_context)} relations, {len(text_units_context)} chunks"
     )
 
     # not necessary to use LLM to generate a response

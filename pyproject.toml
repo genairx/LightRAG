@@ -3,7 +3,7 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "lightrag-hku"
+name = "lightrag"
 dynamic = ["version"]
 authors = [
     {name = "Zirui Guo"}
