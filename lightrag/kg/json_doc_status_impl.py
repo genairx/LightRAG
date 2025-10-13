@@ -105,6 +105,7 @@ class JsonDocStatusStorage(DocStatusStorage):
                         data = v.copy()
                         # Remove deprecated content field if it exists
                         data.pop("content", None)
+                        data.pop("multimodal_processed", None)
                         # If file_path is not in data, use document id as file path
                         if "file_path" not in data:
                             data["file_path"] = "no-file-path"
