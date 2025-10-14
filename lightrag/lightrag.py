@@ -1117,6 +1117,7 @@ class LightRAG:
         if ignored_ids:
             for doc_id in ignored_ids:
                 file_path = new_docs.get(doc_id, {}).get("file_path", "unknown_source")
+                logger.info(f"Doc status: {self.doc_status._data[doc_id]}")
                 logger.warning(
                     f"Ignoring document ID (already exists): {doc_id} ({file_path})"
                 )
