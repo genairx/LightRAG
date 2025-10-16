@@ -1117,7 +1117,7 @@ async def save_to_cache(hashing_kv, cache_data: CacheData):
         else None,
     }
 
-    logger.info(f" == LLM cache == saving: {flattened_key}")
+    logger.debug(f" == LLM cache == saving: {flattened_key}")
 
     # Save using flattened key
     await hashing_kv.upsert({flattened_key: cache_entry})

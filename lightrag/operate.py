@@ -2018,6 +2018,9 @@ async def extract_entities(
     use_llm_func: callable = global_config["llm_model_func"]
     entity_extract_max_gleaning = global_config["entity_extract_max_gleaning"]
 
+    if not chunks:
+        return []
+    
     ordered_chunks = list(chunks.items())
     # add language and example number params to prompt
     language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
