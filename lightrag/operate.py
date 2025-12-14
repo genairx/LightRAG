@@ -1875,6 +1875,15 @@ async def merge_nodes_and_edges(
                             async with pipeline_status_lock:
                                 pipeline_status["latest_message"] = error_msg
                                 pipeline_status["history_messages"].append(error_msg)
+                                
+                                # Prevent memory growth: keep only latest 5000 messages when exceeding 10000
+                                if len(pipeline_status["history_messages"]) > 10000:
+                                    logger.info(
+                                        f"Trimming pipeline history from {len(pipeline_status['history_messages'])} to 5000 messages"
+                                    )
+                                    pipeline_status["history_messages"] = (
+                                        pipeline_status["history_messages"][-5000:]
+                                    )
                     except Exception as status_error:
                         logger.error(
                             f"Failed to update pipeline status: {status_error}"
