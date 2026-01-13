@@ -1,4 +1,5 @@
 import os
+import fcntl
 from dataclasses import dataclass
 from typing import Any, final
 
@@ -19,6 +20,7 @@ from .shared_storage import (
     set_all_update_flags,
     clear_all_update_flags,
     try_initialize_namespace,
+    reset_namespace_initialization,
 )
 
 
@@ -69,20 +71,50 @@ class JsonKVStorage(BaseKVStorage):
                     )
 
     async def index_done_callback(self) -> None:
+        lock_file = self._file_name + ".lock"
+        
         async with self._storage_lock:
-            if self.storage_updated.value:
-                data_dict = (
-                    dict(self._data) if hasattr(self._data, "_getvalue") else self._data
-                )
+            if not self.storage_updated.value:
+                return
 
-                # Calculate data count - all data is now flattened
-                data_count = len(data_dict)
-
-                logger.debug(
-                    f"[{self.workspace}] Process {os.getpid()} KV writting {data_count} records to {self.namespace}"
-                )
-                write_json(data_dict, self._file_name)
-                await clear_all_update_flags(self.final_namespace)
+            # Acquire file lock to prevent race conditions
+            with open(lock_file, "w+") as fd:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                try:
+                    # 1. Reload from disk to get latest state from other processes
+                    disk_data = load_json(self._file_name) or {}
+                    
+                    # 2. Merge logic using timestamps
+                    for k, v in self._data.items():
+                        if k in disk_data:
+                            disk_v = disk_data[k]
+                            # Handle dictionary data with timestamps
+                            if isinstance(disk_v, dict) and isinstance(v, dict):
+                                disk_time = disk_v.get("update_time", 0)
+                                my_time = v.get("update_time", 0)
+                                if my_time >= disk_time:
+                                    disk_data[k] = v
+                            else:
+                                # Fallback for non-dict data: overwrite
+                                disk_data[k] = v
+                        else:
+                            # New key
+                            disk_data[k] = v
+                    
+                    # 3. Write merged data back
+                    data_count = len(disk_data)
+                    logger.debug(
+                        f"[{self.workspace}] Process {os.getpid()} KV writing {data_count} records to {self.namespace}"
+                    )
+                    write_json(disk_data, self._file_name)
+                    
+                    # 4. Update memory to match merged state
+                    self._data = disk_data
+                    
+                    await clear_all_update_flags(self.final_namespace)
+                    
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
 
     async def get_all(self) -> dict[str, Any]:
         """Get all data from storage
@@ -283,3 +315,6 @@ class JsonKVStorage(BaseKVStorage):
         """
         if self.namespace.endswith("_cache"):
             await self.index_done_callback()
+
+        # Reset init flag so next initialize loads from disk
+        await reset_namespace_initialization(self.final_namespace)

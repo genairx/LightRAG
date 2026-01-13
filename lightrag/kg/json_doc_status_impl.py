@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import os
+import fcntl
 from typing import Any, Union, final
 
 from lightrag.base import (
@@ -22,6 +23,7 @@ from .shared_storage import (
     set_all_update_flags,
     clear_all_update_flags,
     try_initialize_namespace,
+    reset_namespace_initialization,
 )
 
 
@@ -151,17 +153,50 @@ class JsonDocStatusStorage(DocStatusStorage):
                         continue
         return result
 
+    async def finalize(self):
+        """Finalize storage resources"""
+        # Reset init flag
+        await reset_namespace_initialization(self.final_namespace)
+
     async def index_done_callback(self) -> None:
+        lock_file = self._file_name + ".lock"
+        
         async with self._storage_lock:
             if self.storage_updated.value:
-                data_dict = (
-                    dict(self._data) if hasattr(self._data, "_getvalue") else self._data
-                )
-                logger.debug(
-                    f"[{self.workspace}] Process {os.getpid()} doc status writting {len(data_dict)} records to {self.namespace}"
-                )
-                write_json(data_dict, self._file_name)
-                await clear_all_update_flags(self.final_namespace)
+                # Acquire file lock to prevent race conditions
+                with open(lock_file, "w+") as fd:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    try:
+                        # 1. Reload from disk
+                        disk_data = load_json(self._file_name) or {}
+                        
+                        # 2. Merge logic using updated_at timestamp
+                        for k, v in self._data.items():
+                            if k in disk_data:
+                                disk_v = disk_data[k]
+                                # Compare updated_at
+                                disk_time = disk_v.get("updated_at", "")
+                                my_time = v.get("updated_at", "")
+                                # Simple string comparison for ISO format works
+                                if my_time >= disk_time:
+                                    disk_data[k] = v
+                            else:
+                                disk_data[k] = v
+                        
+                        # 3. Write merged data
+                        data_count = len(disk_data)
+                        logger.debug(
+                            f"[{self.workspace}] Process {os.getpid()} doc status writing {data_count} records to {self.namespace}"
+                        )
+                        write_json(disk_data, self._file_name)
+                        
+                        # 4. Update memory
+                        self._data = disk_data
+                        
+                        await clear_all_update_flags(self.final_namespace)
+                        
+                    finally:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
         """

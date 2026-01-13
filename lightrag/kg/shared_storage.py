@@ -1194,6 +1194,23 @@ async def try_initialize_namespace(namespace: str) -> bool:
     return False
 
 
+async def reset_namespace_initialization(namespace: str):
+    """Reset initialization flag for a namespace to allow reloading from disk"""
+    global _init_flags
+    if _init_flags is None:
+        return
+
+    async with get_internal_lock():
+        if namespace in _init_flags:
+            if isinstance(_init_flags, dict):
+                # Standard dict (single process) or Manager dict (multi process)
+                # Manager dicts support del
+                del _init_flags[namespace]
+            direct_log(
+                f"Process {os.getpid()} reset initialization flag for namespace: [{namespace}]"
+            )
+
+
 async def get_namespace_data(
     namespace: str, first_init: bool = False
 ) -> Dict[str, Any]:
