@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import final
 
 from lightrag.types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
-from lightrag.utils import logger
+from lightrag.utils import logger, compute_mdhash_id
 from lightrag.base import BaseGraphStorage
 from lightrag.constants import GRAPH_FIELD_SEP
 import networkx as nx
@@ -39,13 +39,16 @@ class NetworkXStorage(BaseGraphStorage):
 
     def __post_init__(self):
         working_dir = self.global_config["working_dir"]
+        working_dir_hash = compute_mdhash_id(working_dir, prefix="")
         if self.workspace:
             # Include workspace in the file path for data isolation
             workspace_dir = os.path.join(working_dir, self.workspace)
-            self.final_namespace = f"{self.workspace}_{self.namespace}"
+            self.final_namespace = (
+                f"{self.workspace}_{working_dir_hash}_{self.namespace}"
+            )
         else:
             # Default behavior when workspace is empty
-            self.final_namespace = self.namespace
+            self.final_namespace = f"{working_dir_hash}_{self.namespace}"
             workspace_dir = working_dir
             self.workspace = "_"
 

@@ -57,6 +57,8 @@ from lightrag.kg.shared_storage import (
     get_pipeline_status_lock,
     get_graph_db_lock,
     get_data_init_lock,
+    get_keyed_lock,
+    initialize_pipeline_status,
 )
 
 from lightrag.base import (
@@ -383,6 +385,15 @@ class LightRAG:
     """Configuration for Ollama server information."""
 
     _storages_status: StoragesStatus = field(default=StoragesStatus.NOT_CREATED)
+
+    @property
+    def pipeline_status_key(self) -> str:
+        """Get unique pipeline status key for this LightRAG instance"""
+        return f"pipeline_status_{compute_mdhash_id(self.working_dir)}"
+
+    async def initialize_pipeline_status(self):
+        """Initialize pipeline status for this LightRAG instance"""
+        await initialize_pipeline_status(self.pipeline_status_key)
 
     def __post_init__(self):
         from lightrag.kg.shared_storage import (
@@ -1369,8 +1380,10 @@ class LightRAG:
         """
 
         # Get pipeline status shared data and lock
-        pipeline_status = await get_namespace_data("pipeline_status")
-        pipeline_status_lock = get_pipeline_status_lock()
+        pipeline_status = await get_namespace_data(self.pipeline_status_key)
+        pipeline_status_lock = get_keyed_lock(
+            "pipeline_status_locks", self.pipeline_status_key
+        )
 
         # Check if another process is already processing the queue
         async with pipeline_status_lock:
@@ -1649,7 +1662,7 @@ class LightRAG:
                                     }
                                 }
                             )
-
+                        
                         # Concurrency is controlled by keyed lock for individual entities and relationships
                         if file_extraction_stage_ok:
                             try:
@@ -2590,8 +2603,10 @@ class LightRAG:
         original_exception = None
 
         # Get pipeline status shared data and lock for status updates
-        pipeline_status = await get_namespace_data("pipeline_status")
-        pipeline_status_lock = get_pipeline_status_lock()
+        pipeline_status = await get_namespace_data(self.pipeline_status_key)
+        pipeline_status_lock = get_keyed_lock(
+            "pipeline_status_locks", self.pipeline_status_key
+        )
 
         async with pipeline_status_lock:
             log_message = f"Starting deletion process for document {doc_id}"

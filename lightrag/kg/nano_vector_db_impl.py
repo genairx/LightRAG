@@ -2,6 +2,7 @@ import asyncio
 import base64
 import os
 import zlib
+import fcntl
 from typing import Any, final
 from dataclasses import dataclass
 import numpy as np
@@ -40,13 +41,16 @@ class NanoVectorDBStorage(BaseVectorStorage):
         self.cosine_better_than_threshold = cosine_threshold
 
         working_dir = self.global_config["working_dir"]
+        working_dir_hash = compute_mdhash_id(working_dir, prefix="")
         if self.workspace:
             # Include workspace in the file path for data isolation
             workspace_dir = os.path.join(working_dir, self.workspace)
-            self.final_namespace = f"{self.workspace}_{self.namespace}"
+            self.final_namespace = (
+                f"{self.workspace}_{working_dir_hash}_{self.namespace}"
+            )
         else:
             # Default behavior when workspace is empty
-            self.final_namespace = self.namespace
+            self.final_namespace = f"{working_dir_hash}_{self.namespace}"
             self.workspace = "_"
             workspace_dir = working_dir
 
@@ -277,8 +281,16 @@ class NanoVectorDBStorage(BaseVectorStorage):
         # Acquire lock and perform persistence
         async with self._storage_lock:
             try:
-                # Save data to disk
-                self._client.save()
+                # Acquire file lock to prevent corruption from concurrent writes
+                lock_file = self._client_file_name + ".lock"
+                with open(lock_file, 'w') as lockf:
+                    fcntl.flock(lockf, fcntl.LOCK_EX)
+                    try:
+                        # Save data to disk
+                        self._client.save()
+                    finally:
+                        fcntl.flock(lockf, fcntl.LOCK_UN)
+                
                 # Notify other processes that data has been updated
                 await set_all_update_flags(self.final_namespace)
                 # Reset own update flag to avoid self-reloading

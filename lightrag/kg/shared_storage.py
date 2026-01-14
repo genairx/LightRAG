@@ -897,6 +897,16 @@ def get_data_init_lock(enable_logging: bool = False) -> UnifiedLock:
     )
 
 
+def get_keyed_lock(
+    namespace: str, key: str, enable_logging: bool = False
+) -> UnifiedLock:
+    """Return a single UnifiedLock for a specific key from the keyed lock manager"""
+    global _storage_keyed_lock
+    if _storage_keyed_lock is None:
+        raise RuntimeError("Shared-Data is not initialized")
+    return _storage_keyed_lock._get_lock_for_key(namespace, key, enable_logging)
+
+
 def cleanup_keyed_lock() -> Dict[str, Any]:
     """
     Force cleanup of expired keyed locks and return comprehensive status information.
@@ -1054,12 +1064,14 @@ def initialize_share_data(workers: int = 1):
     _initialized = True
 
 
-async def initialize_pipeline_status():
+async def initialize_pipeline_status(custom_key: str = "pipeline_status"):
     """
     Initialize pipeline namespace with default values.
     This function is called during FASTAPI lifespan for each worker.
+    Args:
+        custom_key: Custom key for the pipeline status namespace (default: "pipeline_status")
     """
-    pipeline_namespace = await get_namespace_data("pipeline_status", first_init=True)
+    pipeline_namespace = await get_namespace_data(custom_key, first_init=True)
 
     async with get_internal_lock():
         # Check if already initialized by checking for required fields

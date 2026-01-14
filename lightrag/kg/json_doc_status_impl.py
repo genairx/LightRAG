@@ -13,6 +13,7 @@ from lightrag.utils import (
     logger,
     write_json,
     get_pinyin_sort_key,
+    compute_mdhash_id,
 )
 from lightrag.exceptions import StorageNotInitializedError
 from .shared_storage import (
@@ -34,13 +35,16 @@ class JsonDocStatusStorage(DocStatusStorage):
 
     def __post_init__(self):
         working_dir = self.global_config["working_dir"]
+        working_dir_hash = compute_mdhash_id(working_dir, prefix="")
         if self.workspace:
             # Include workspace in the file path for data isolation
             workspace_dir = os.path.join(working_dir, self.workspace)
-            self.final_namespace = f"{self.workspace}_{self.namespace}"
+            self.final_namespace = (
+                f"{self.workspace}_{working_dir_hash}_{self.namespace}"
+            )
         else:
             # Default behavior when workspace is empty
-            self.final_namespace = self.namespace
+            self.final_namespace = f"{working_dir_hash}_{self.namespace}"
             self.workspace = "_"
             workspace_dir = working_dir
 

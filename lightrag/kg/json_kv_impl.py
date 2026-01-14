@@ -10,6 +10,7 @@ from lightrag.utils import (
     load_json,
     logger,
     write_json,
+    compute_mdhash_id,
 )
 from lightrag.exceptions import StorageNotInitializedError
 from .shared_storage import (
@@ -29,14 +30,17 @@ from .shared_storage import (
 class JsonKVStorage(BaseKVStorage):
     def __post_init__(self):
         working_dir = self.global_config["working_dir"]
+        working_dir_hash = compute_mdhash_id(working_dir, prefix="")
         if self.workspace:
             # Include workspace in the file path for data isolation
             workspace_dir = os.path.join(working_dir, self.workspace)
-            self.final_namespace = f"{self.workspace}_{self.namespace}"
+            self.final_namespace = (
+                f"{self.workspace}_{working_dir_hash}_{self.namespace}"
+            )
         else:
             # Default behavior when workspace is empty
             workspace_dir = working_dir
-            self.final_namespace = self.namespace
+            self.final_namespace = f"{working_dir_hash}_{self.namespace}"
             self.workspace = "_"
 
         os.makedirs(workspace_dir, exist_ok=True)
@@ -69,6 +73,10 @@ class JsonKVStorage(BaseKVStorage):
                     logger.info(
                         f"[{self.workspace}] Process {os.getpid()} KV load {self.namespace} with {data_count} records"
                     )
+            else:
+                # If already initialized, check if we need to sync updates from disk
+                # This handles the case where other processes updated the storage
+                await self.index_done_callback()
 
     async def index_done_callback(self) -> None:
         lock_file = self._file_name + ".lock"
