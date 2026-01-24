@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from enum import Enum
 import os
+import contextlib
 from dotenv import load_dotenv
 from dataclasses import dataclass, field
 from typing import (
@@ -183,6 +184,15 @@ class StorageNameSpace(ABC):
     async def finalize(self):
         """Finalize the storage"""
         pass
+
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        """
+        Optional transaction context manager for atomic operations.
+        Default implementation is a no-op that yields self.
+        Subclasses should override this if they support transactions (e.g. file locking).
+        """
+        yield self
 
     @abstractmethod
     async def index_done_callback(self) -> None:

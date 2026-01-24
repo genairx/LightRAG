@@ -895,8 +895,30 @@ def load_json(file_name):
 
 
 def write_json(json_obj, file_name):
-    with open(file_name, "w", encoding="utf-8") as f:
-        json.dump(json_obj, f, indent=2, ensure_ascii=False)
+    import tempfile
+    import shutil
+
+    dir_name = os.path.dirname(file_name) or "."
+    # Use delete=False so we can close and rename it
+    with tempfile.NamedTemporaryFile(
+        "w", dir=dir_name, delete=False, encoding="utf-8"
+    ) as tf:
+        json.dump(json_obj, tf, indent=2, ensure_ascii=False)
+        temp_name = tf.name
+
+    try:
+        # Preserve file permissions if target exists
+        if os.path.exists(file_name):
+            shutil.copymode(file_name, temp_name)
+        else:
+            # Set default permissions (644) if creating new file
+            os.chmod(temp_name, 0o644)
+            
+        os.replace(temp_name, file_name)
+    except Exception:
+        if os.path.exists(temp_name):
+            os.remove(temp_name)
+        raise
 
 
 class TokenizerInterface(Protocol):
@@ -1558,8 +1580,8 @@ async def update_chunk_cache_list(
     if not cache_keys:
         return
 
-    try:
-        chunk_data = await text_chunks_storage.get_by_id(chunk_id)
+    async def _do_update(storage):
+        chunk_data = await storage.get_by_id(chunk_id)
         if chunk_data:
             # Ensure llm_cache_list exists
             if "llm_cache_list" not in chunk_data:
@@ -1573,10 +1595,19 @@ async def update_chunk_cache_list(
                 chunk_data["llm_cache_list"].extend(new_keys)
 
                 # Update the chunk in storage
-                await text_chunks_storage.upsert({chunk_id: chunk_data})
+                await storage.upsert({chunk_id: chunk_data})
                 logger.debug(
                     f"Updated chunk {chunk_id} with {len(new_keys)} cache keys ({cache_scenario})"
                 )
+
+    try:
+        # Use transaction if supported (e.g. JsonKVStorage) to prevent lost updates
+        if hasattr(text_chunks_storage, "transaction"):
+            async with text_chunks_storage.transaction() as tx:
+                await _do_update(tx)
+        else:
+            await _do_update(text_chunks_storage)
+
     except Exception as e:
         logger.warning(
             f"Failed to update chunk {chunk_id} with cache references on {cache_scenario}: {e}"

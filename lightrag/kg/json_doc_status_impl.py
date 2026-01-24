@@ -1,6 +1,9 @@
 from dataclasses import dataclass
 import os
+import time
 import fcntl
+import asyncio
+import contextlib
 from typing import Any, Union, final
 
 from lightrag.base import (
@@ -8,6 +11,7 @@ from lightrag.base import (
     DocStatus,
     DocStatusStorage,
 )
+from .json_common import JsonStorageLockMixin
 from lightrag.utils import (
     load_json,
     logger,
@@ -30,7 +34,7 @@ from .shared_storage import (
 
 @final
 @dataclass
-class JsonDocStatusStorage(DocStatusStorage):
+class JsonDocStatusStorage(DocStatusStorage, JsonStorageLockMixin):
     """JSON implementation of document status storage"""
 
     def __post_init__(self):
@@ -53,6 +57,7 @@ class JsonDocStatusStorage(DocStatusStorage):
         self._data = None
         self._storage_lock = None
         self.storage_updated = None
+        self.init_lock_stats()
 
     async def initialize(self):
         """Initialize storage data"""
@@ -63,7 +68,12 @@ class JsonDocStatusStorage(DocStatusStorage):
             need_init = await try_initialize_namespace(self.final_namespace)
             self._data = await get_namespace_data(self.final_namespace)
             if need_init:
-                loaded_data = load_json(self._file_name) or {}
+                # Use shared lock to read initial data safely
+                lock_file = self._file_name + ".lock"
+                with open(lock_file, "w+") as fd:
+                    async with self._file_lock(fd, fcntl.LOCK_SH, lock_file):
+                        loaded_data = load_json(self._file_name) or {}
+
                 async with self._storage_lock:
                     self._data.update(loaded_data)
                     logger.info(
@@ -78,89 +88,174 @@ class JsonDocStatusStorage(DocStatusStorage):
             return set(keys) - set(self._data.keys())
 
     async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
         if self._storage_lock is None:
             raise StorageNotInitializedError("JsonDocStatusStorage")
         async with self._storage_lock:
-            for id in ids:
-                data = self._data.get(id, None)
-                if data:
-                    result.append(data)
+            return await self._get_by_ids_no_lock(ids)
+
+    async def _get_by_ids_no_lock(self, ids: list[str]) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for id in ids:
+            data = self._data.get(id, None)
+            if data:
+                result.append(data)
         return result
 
     async def get_status_counts(self) -> dict[str, int]:
-        """Get counts of documents in each status"""
-        counts = {status.value: 0 for status in DocStatus}
         if self._storage_lock is None:
             raise StorageNotInitializedError("JsonDocStatusStorage")
         async with self._storage_lock:
-            for doc in self._data.values():
-                counts[doc["status"]] += 1
+            return await self._get_status_counts_no_lock()
+
+    async def _get_status_counts_no_lock(self) -> dict[str, int]:
+        counts = {status.value: 0 for status in DocStatus}
+        for doc in self._data.values():
+            counts[doc["status"]] += 1
         return counts
 
     async def get_docs_by_status(
         self, status: DocStatus
     ) -> dict[str, DocProcessingStatus]:
-        """Get all documents with a specific status"""
-        result = {}
         async with self._storage_lock:
-            for k, v in self._data.items():
-                if v["status"] == status.value:
-                    try:
-                        # Make a copy of the data to avoid modifying the original
-                        data = v.copy()
-                        # Remove deprecated content field if it exists
-                        data.pop("content", None)
-                        data.pop("multimodal_processed", None)
-                        # If file_path is not in data, use document id as file path
-                        if "file_path" not in data:
-                            data["file_path"] = "no-file-path"
-                        # Ensure new fields exist with default values
-                        if "metadata" not in data:
-                            data["metadata"] = {}
-                        if "error_msg" not in data:
-                            data["error_msg"] = None
-                        result[k] = DocProcessingStatus(**data)
-                    except KeyError as e:
-                        logger.error(
-                            f"[{self.workspace}] Missing required field for document {k}: {e}"
-                        )
-                        continue
+            return await self._get_docs_by_status_no_lock(status)
+
+    async def _get_docs_by_status_no_lock(
+        self, status: DocStatus
+    ) -> dict[str, DocProcessingStatus]:
+        result = {}
+        for k, v in self._data.items():
+            if v["status"] == status.value:
+                try:
+                    data = v.copy()
+                    data.pop("content", None)
+                    data.pop("multimodal_processed", None)
+                    if "file_path" not in data:
+                        data["file_path"] = "no-file-path"
+                    if "metadata" not in data:
+                        data["metadata"] = {}
+                    if "error_msg" not in data:
+                        data["error_msg"] = None
+                    result[k] = DocProcessingStatus(**data)
+                except KeyError as e:
+                    logger.error(
+                        f"[{self.workspace}] Missing required field for document {k}: {e}"
+                    )
+                    continue
         return result
 
     async def get_docs_by_track_id(
         self, track_id: str
     ) -> dict[str, DocProcessingStatus]:
-        """Get all documents with a specific track_id"""
-        result = {}
         async with self._storage_lock:
-            for k, v in self._data.items():
-                if v.get("track_id") == track_id:
-                    try:
-                        # Make a copy of the data to avoid modifying the original
-                        data = v.copy()
-                        # Remove deprecated content field if it exists
-                        data.pop("content", None)
-                        # If file_path is not in data, use document id as file path
-                        if "file_path" not in data:
-                            data["file_path"] = "no-file-path"
-                        # Ensure new fields exist with default values
-                        if "metadata" not in data:
-                            data["metadata"] = {}
-                        if "error_msg" not in data:
-                            data["error_msg"] = None
-                        result[k] = DocProcessingStatus(**data)
-                    except KeyError as e:
-                        logger.error(
-                            f"[{self.workspace}] Missing required field for document {k}: {e}"
-                        )
-                        continue
+            return await self._get_docs_by_track_id_no_lock(track_id)
+
+    async def _get_docs_by_track_id_no_lock(
+        self, track_id: str
+    ) -> dict[str, DocProcessingStatus]:
+        result = {}
+        for k, v in self._data.items():
+            if v.get("track_id") == track_id:
+                try:
+                    data = v.copy()
+                    data.pop("content", None)
+                    if "file_path" not in data:
+                        data["file_path"] = "no-file-path"
+                    if "metadata" not in data:
+                        data["metadata"] = {}
+                    if "error_msg" not in data:
+                        data["error_msg"] = None
+                    result[k] = DocProcessingStatus(**data)
+                except KeyError as e:
+                    logger.error(
+                        f"[{self.workspace}] Missing required field for document {k}: {e}"
+                    )
+                    continue
         return result
 
     async def finalize(self):
         """Finalize storage resources"""
         # Reset init flag
         await reset_namespace_initialization(self.final_namespace)
+
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        """
+        Context manager for atomic read-modify-write operations.
+        Acquires an exclusive lock on the storage file, ensuring isolation.
+        """
+        start_time = time.time()
+        if self._storage_lock is None:
+            raise StorageNotInitializedError("JsonDocStatusStorage")
+
+        lock_file = self._file_name + ".lock"
+
+        # Acquire asyncio lock to coordinate with local tasks
+        async with self._storage_lock:
+            # Acquire file lock to coordinate with other processes
+            with open(lock_file, "w+") as fd:
+                async with self._file_lock(fd, fcntl.LOCK_EX, lock_file):
+                    # 1. Reload from disk
+                    disk_data = load_json(self._file_name) or {}
+
+                    # 2. Merge logic using updated_at timestamp (Same as index_done_callback)
+                    for k, v in self._data.items():
+                        if k in disk_data:
+                            disk_v = disk_data[k]
+                            # Compare updated_at
+                            disk_time = disk_v.get("updated_at", "")
+                            my_time = v.get("updated_at", "")
+                            # Simple string comparison for ISO format works
+                            if my_time >= disk_time:
+                                disk_data[k] = v
+                        else:
+                            disk_data[k] = v
+
+                    # Update memory
+                    self._data = disk_data
+
+                    yield self._TransactionWrapper(self)
+
+                    # 3. Persist changes
+                    write_json(self._data, self._file_name)
+                    await clear_all_update_flags(self.final_namespace)
+
+        # Record transaction stats
+        end_time = time.time()
+        self._update_tx_stats(end_time - start_time, self._file_name)
+
+    class _TransactionWrapper:
+        def __init__(self, storage):
+            self._storage = storage
+
+        def __getattr__(self, name):
+            return getattr(self._storage, name)
+
+        async def get_by_id(self, id: str) -> Union[dict[str, Any], None]:
+            return await self._storage._get_by_id_no_lock(id)
+
+        async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
+            return await self._storage._get_by_ids_no_lock(ids)
+
+        async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
+            return await self._storage._upsert_no_lock(data)
+
+        async def get_status_counts(self) -> dict[str, int]:
+            return await self._storage._get_status_counts_no_lock()
+
+        async def get_docs_by_status(self, status: DocStatus) -> dict[str, DocProcessingStatus]:
+            return await self._storage._get_docs_by_status_no_lock(status)
+
+        async def get_docs_by_track_id(self, track_id: str) -> dict[str, DocProcessingStatus]:
+            return await self._storage._get_docs_by_track_id_no_lock(track_id)
+
+        async def get_docs_paginated(self, *args, **kwargs):
+            return await self._storage._get_docs_paginated_no_lock(*args, **kwargs)
+
+        async def get_doc_by_file_path(self, file_path: str):
+            return await self._storage._get_doc_by_file_path_no_lock(file_path)
+
+        async def delete(self, ids: list[str]) -> None:
+            return await self._storage._delete_no_lock(ids)
 
     async def index_done_callback(self) -> None:
         lock_file = self._file_name + ".lock"
@@ -169,8 +264,7 @@ class JsonDocStatusStorage(DocStatusStorage):
             if self.storage_updated.value:
                 # Acquire file lock to prevent race conditions
                 with open(lock_file, "w+") as fd:
-                    fcntl.flock(fd, fcntl.LOCK_EX)
-                    try:
+                    async with self._file_lock(fd, fcntl.LOCK_EX, lock_file):
                         # 1. Reload from disk
                         disk_data = load_json(self._file_name) or {}
                         
@@ -198,36 +292,34 @@ class JsonDocStatusStorage(DocStatusStorage):
                         self._data = disk_data
                         
                         await clear_all_update_flags(self.final_namespace)
-                        
-                    finally:
-                        fcntl.flock(fd, fcntl.LOCK_UN)
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
-        """
-        Importance notes for in-memory storage:
-        1. Changes will be persisted to disk during the next index_done_callback
-        2. update flags to notify other processes that data persistence is needed
-        """
+        if self._storage_lock is None:
+            raise StorageNotInitializedError("JsonDocStatusStorage")
+        async with self._storage_lock:
+            await self._upsert_no_lock(data)
+        
+        await self.index_done_callback()
+
+    async def _upsert_no_lock(self, data: dict[str, dict[str, Any]]) -> None:
         if not data:
             return
         logger.debug(
             f"[{self.workspace}] Inserting {len(data)} records to {self.namespace}"
         )
-        if self._storage_lock is None:
-            raise StorageNotInitializedError("JsonDocStatusStorage")
-        async with self._storage_lock:
-            # Ensure chunks_list field exists for new documents
-            for doc_id, doc_data in data.items():
-                if "chunks_list" not in doc_data:
-                    doc_data["chunks_list"] = []
-            self._data.update(data)
-            await set_all_update_flags(self.final_namespace)
-
-        await self.index_done_callback()
+        # Ensure chunks_list field exists for new documents
+        for doc_id, doc_data in data.items():
+            if "chunks_list" not in doc_data:
+                doc_data["chunks_list"] = []
+        self._data.update(data)
+        await set_all_update_flags(self.final_namespace)
 
     async def get_by_id(self, id: str) -> Union[dict[str, Any], None]:
         async with self._storage_lock:
             return self._data.get(id)
+
+    async def _get_by_id_no_lock(self, id: str) -> Union[dict[str, Any], None]:
+        return self._data.get(id)
 
     async def get_docs_paginated(
         self,
@@ -237,18 +329,19 @@ class JsonDocStatusStorage(DocStatusStorage):
         sort_field: str = "updated_at",
         sort_direction: str = "desc",
     ) -> tuple[list[tuple[str, DocProcessingStatus]], int]:
-        """Get documents with pagination support
+        async with self._storage_lock:
+            return await self._get_docs_paginated_no_lock(
+                status_filter, page, page_size, sort_field, sort_direction
+            )
 
-        Args:
-            status_filter: Filter by document status, None for all statuses
-            page: Page number (1-based)
-            page_size: Number of documents per page (10-200)
-            sort_field: Field to sort by ('created_at', 'updated_at', 'id')
-            sort_direction: Sort direction ('asc' or 'desc')
-
-        Returns:
-            Tuple of (list of (doc_id, DocProcessingStatus) tuples, total_count)
-        """
+    async def _get_docs_paginated_no_lock(
+        self,
+        status_filter: DocStatus | None = None,
+        page: int = 1,
+        page_size: int = 50,
+        sort_field: str = "updated_at",
+        sort_direction: str = "desc",
+    ) -> tuple[list[tuple[str, DocProcessingStatus]], int]:
         # Validate parameters
         if page < 1:
             page = 1
@@ -266,45 +359,44 @@ class JsonDocStatusStorage(DocStatusStorage):
         # For JSON storage, we load all data and sort/filter in memory
         all_docs = []
 
-        async with self._storage_lock:
-            for doc_id, doc_data in self._data.items():
-                # Apply status filter
-                if (
-                    status_filter is not None
-                    and doc_data.get("status") != status_filter.value
-                ):
-                    continue
+        for doc_id, doc_data in self._data.items():
+            # Apply status filter
+            if (
+                status_filter is not None
+                and doc_data.get("status") != status_filter.value
+            ):
+                continue
 
-                try:
-                    # Prepare document data
-                    data = doc_data.copy()
-                    data.pop("content", None)
-                    if "file_path" not in data:
-                        data["file_path"] = "no-file-path"
-                    if "metadata" not in data:
-                        data["metadata"] = {}
-                    if "error_msg" not in data:
-                        data["error_msg"] = None
+            try:
+                # Prepare document data
+                data = doc_data.copy()
+                data.pop("content", None)
+                if "file_path" not in data:
+                    data["file_path"] = "no-file-path"
+                if "metadata" not in data:
+                    data["metadata"] = {}
+                if "error_msg" not in data:
+                    data["error_msg"] = None
 
-                    doc_status = DocProcessingStatus(**data)
+                doc_status = DocProcessingStatus(**data)
 
-                    # Add sort key for sorting
-                    if sort_field == "id":
-                        doc_status._sort_key = doc_id
-                    elif sort_field == "file_path":
-                        # Use pinyin sorting for file_path field to support Chinese characters
-                        file_path_value = getattr(doc_status, sort_field, "")
-                        doc_status._sort_key = get_pinyin_sort_key(file_path_value)
-                    else:
-                        doc_status._sort_key = getattr(doc_status, sort_field, "")
+                # Add sort key for sorting
+                if sort_field == "id":
+                    doc_status._sort_key = doc_id
+                elif sort_field == "file_path":
+                    # Use pinyin sorting for file_path field to support Chinese characters
+                    file_path_value = getattr(doc_status, sort_field, "")
+                    doc_status._sort_key = get_pinyin_sort_key(file_path_value)
+                else:
+                    doc_status._sort_key = getattr(doc_status, sort_field, "")
 
-                    all_docs.append((doc_id, doc_status))
+                all_docs.append((doc_id, doc_status))
 
-                except KeyError as e:
-                    logger.error(
-                        f"[{self.workspace}] Error processing document {doc_id}: {e}"
-                    )
-                    continue
+            except KeyError as e:
+                logger.error(
+                    f"[{self.workspace}] Error processing document {doc_id}: {e}"
+                )
+                continue
 
         # Sort documents
         reverse_sort = sort_direction.lower() == "desc"
@@ -341,66 +433,35 @@ class JsonDocStatusStorage(DocStatusStorage):
         return counts
 
     async def delete(self, doc_ids: list[str]) -> None:
-        """Delete specific records from storage by their IDs
-
-        Importance notes for in-memory storage:
-        1. Changes will be persisted to disk during the next index_done_callback
-        2. update flags to notify other processes that data persistence is needed
-
-        Args:
-            ids (list[str]): List of document IDs to be deleted from storage
-
-        Returns:
-            None
-        """
         async with self._storage_lock:
-            any_deleted = False
-            for doc_id in doc_ids:
-                result = self._data.pop(doc_id, None)
-                if result is not None:
-                    any_deleted = True
+            await self._delete_no_lock(doc_ids)
 
-            if any_deleted:
-                await set_all_update_flags(self.final_namespace)
+    async def _delete_no_lock(self, doc_ids: list[str]) -> None:
+        any_deleted = False
+        for doc_id in doc_ids:
+            result = self._data.pop(doc_id, None)
+            if result is not None:
+                any_deleted = True
+
+        if any_deleted:
+            await set_all_update_flags(self.final_namespace)
 
     async def get_doc_by_file_path(self, file_path: str) -> Union[dict[str, Any], None]:
-        """Get document by file path
-
-        Args:
-            file_path: The file path to search for
-
-        Returns:
-            Union[dict[str, Any], None]: Document data if found, None otherwise
-            Returns the same format as get_by_ids method
-        """
         if self._storage_lock is None:
             raise StorageNotInitializedError("JsonDocStatusStorage")
-
         async with self._storage_lock:
-            for doc_id, doc_data in self._data.items():
-                if doc_data.get("file_path") == file_path:
-                    # Return complete document data, consistent with get_by_ids method
-                    return doc_data
+            return await self._get_doc_by_file_path_no_lock(file_path)
 
+    async def _get_doc_by_file_path_no_lock(self, file_path: str) -> Union[dict[str, Any], None]:
+        for doc_id, doc_data in self._data.items():
+            if doc_data.get("file_path") == file_path:
+                return doc_data
         return None
 
     async def drop(self) -> dict[str, str]:
-        """Drop all document status data from storage and clean up resources
-
-        This method will:
-        1. Clear all document status data from memory
-        2. Update flags to notify other processes
-        3. Trigger index_done_callback to save the empty state
-
-        Returns:
-            dict[str, str]: Operation status and message
-            - On success: {"status": "success", "message": "data dropped"}
-            - On failure: {"status": "error", "message": "<error details>"}
-        """
         try:
             async with self._storage_lock:
-                self._data.clear()
-                await set_all_update_flags(self.final_namespace)
+                await self._drop_no_lock()
 
             await self.index_done_callback()
             logger.info(
@@ -410,3 +471,7 @@ class JsonDocStatusStorage(DocStatusStorage):
         except Exception as e:
             logger.error(f"[{self.workspace}] Error dropping {self.namespace}: {e}")
             return {"status": "error", "message": str(e)}
+
+    async def _drop_no_lock(self) -> None:
+        self._data.clear()
+        await set_all_update_flags(self.final_namespace)

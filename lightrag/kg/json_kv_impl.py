@@ -1,11 +1,15 @@
 import os
+import time
 import fcntl
+import asyncio
+import contextlib
 from dataclasses import dataclass
 from typing import Any, final
 
 from lightrag.base import (
     BaseKVStorage,
 )
+from .json_common import JsonStorageLockMixin
 from lightrag.utils import (
     load_json,
     logger,
@@ -27,7 +31,7 @@ from .shared_storage import (
 
 @final
 @dataclass
-class JsonKVStorage(BaseKVStorage):
+class JsonKVStorage(BaseKVStorage, JsonStorageLockMixin):
     def __post_init__(self):
         working_dir = self.global_config["working_dir"]
         working_dir_hash = compute_mdhash_id(working_dir, prefix="")
@@ -49,6 +53,7 @@ class JsonKVStorage(BaseKVStorage):
         self._data = None
         self._storage_lock = None
         self.storage_updated = None
+        self.init_lock_stats()
 
     async def initialize(self):
         """Initialize storage data"""
@@ -59,7 +64,12 @@ class JsonKVStorage(BaseKVStorage):
             need_init = await try_initialize_namespace(self.final_namespace)
             self._data = await get_namespace_data(self.final_namespace)
             if need_init:
-                loaded_data = load_json(self._file_name) or {}
+                # Use shared lock to read initial data safely
+                lock_file = self._file_name + ".lock"
+                with open(lock_file, "w+") as fd:
+                    async with self._file_lock(fd, fcntl.LOCK_SH, lock_file):
+                        loaded_data = load_json(self._file_name) or {}
+
                 async with self._storage_lock:
                     # Migrate legacy cache structure if needed
                     if self.namespace.endswith("_cache"):
@@ -87,8 +97,7 @@ class JsonKVStorage(BaseKVStorage):
 
             # Acquire file lock to prevent race conditions
             with open(lock_file, "w+") as fd:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-                try:
+                async with self._file_lock(fd, fcntl.LOCK_EX, lock_file):
                     # 1. Reload from disk to get latest state from other processes
                     disk_data = load_json(self._file_name) or {}
                     
@@ -120,125 +129,109 @@ class JsonKVStorage(BaseKVStorage):
                     self._data = disk_data
                     
                     await clear_all_update_flags(self.final_namespace)
-                    
-                finally:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
 
     async def get_all(self) -> dict[str, Any]:
-        """Get all data from storage
-
-        Returns:
-            Dictionary containing all stored data
-        """
+        """Get all data from storage"""
         async with self._storage_lock:
-            result = {}
-            for key, value in self._data.items():
-                if value:
-                    # Create a copy to avoid modifying the original data
-                    data = dict(value)
-                    # Ensure time fields are present, provide default values for old data
-                    data.setdefault("create_time", 0)
-                    data.setdefault("update_time", 0)
-                    result[key] = data
-                else:
-                    result[key] = value
-            return result
+            return await self._get_all_no_lock()
+
+    async def _get_all_no_lock(self) -> dict[str, Any]:
+        result = {}
+        for key, value in self._data.items():
+            if value:
+                data = dict(value)
+                data.setdefault("create_time", 0)
+                data.setdefault("update_time", 0)
+                result[key] = data
+            else:
+                result[key] = value
+        return result
 
     async def get_by_id(self, id: str) -> dict[str, Any] | None:
         async with self._storage_lock:
-            result = self._data.get(id)
-            if result:
-                # Create a copy to avoid modifying the original data
-                result = dict(result)
-                # Ensure time fields are present, provide default values for old data
-                result.setdefault("create_time", 0)
-                result.setdefault("update_time", 0)
-                # Ensure _id field contains the clean ID
-                result["_id"] = id
-            return result
+            return await self._get_by_id_no_lock(id)
+
+    async def _get_by_id_no_lock(self, id: str) -> dict[str, Any] | None:
+        result = self._data.get(id)
+        if result:
+            result = dict(result)
+            result.setdefault("create_time", 0)
+            result.setdefault("update_time", 0)
+            result["_id"] = id
+        return result
 
     async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
         async with self._storage_lock:
-            results = []
-            for id in ids:
-                data = self._data.get(id, None)
-                if data:
-                    # Create a copy to avoid modifying the original data
-                    result = {k: v for k, v in data.items()}
-                    # Ensure time fields are present, provide default values for old data
-                    result.setdefault("create_time", 0)
-                    result.setdefault("update_time", 0)
-                    # Ensure _id field contains the clean ID
-                    result["_id"] = id
-                    results.append(result)
-                else:
-                    results.append(None)
-            return results
+            return await self._get_by_ids_no_lock(ids)
+
+    async def _get_by_ids_no_lock(self, ids: list[str]) -> list[dict[str, Any]]:
+        results = []
+        for id in ids:
+            data = self._data.get(id, None)
+            if data:
+                result = {k: v for k, v in data.items()}
+                result.setdefault("create_time", 0)
+                result.setdefault("update_time", 0)
+                result["_id"] = id
+                results.append(result)
+            else:
+                results.append(None)
+        return results
 
     async def filter_keys(self, keys: set[str]) -> set[str]:
         async with self._storage_lock:
             return set(keys) - set(self._data.keys())
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
-        """
-        Importance notes for in-memory storage:
-        1. Changes will be persisted to disk during the next index_done_callback
-        2. update flags to notify other processes that data persistence is needed
-        """
+        if self._storage_lock is None:
+            raise StorageNotInitializedError("JsonKVStorage")
+        async with self._storage_lock:
+            await self._upsert_no_lock(data)
+
+    async def _upsert_no_lock(self, data: dict[str, dict[str, Any]]) -> None:
         if not data:
             return
 
         import time
 
-        current_time = int(time.time())  # Get current Unix timestamp
+        current_time = int(time.time())
 
         logger.debug(
             f"[{self.workspace}] Inserting {len(data)} records to {self.namespace}"
         )
-        if self._storage_lock is None:
-            raise StorageNotInitializedError("JsonKVStorage")
-        async with self._storage_lock:
-            # Add timestamps to data based on whether key exists
-            for k, v in data.items():
-                # For text_chunks namespace, ensure llm_cache_list field exists
-                if self.namespace.endswith("text_chunks"):
-                    if "llm_cache_list" not in v:
-                        v["llm_cache_list"] = []
 
-                # Add timestamps based on whether key exists
-                if k in self._data:  # Key exists, only update update_time
-                    v["update_time"] = current_time
-                else:  # New key, set both create_time and update_time
-                    v["create_time"] = current_time
-                    v["update_time"] = current_time
+        # Add timestamps to data based on whether key exists
+        for k, v in data.items():
+            # For text_chunks namespace, ensure llm_cache_list field exists
+            if self.namespace.endswith("text_chunks"):
+                if "llm_cache_list" not in v:
+                    v["llm_cache_list"] = []
 
-                v["_id"] = k
+            # Add timestamps based on whether key exists
+            if k in self._data:  # Key exists, only update update_time
+                v["update_time"] = current_time
+            else:  # New key, set both create_time and update_time
+                v["create_time"] = current_time
+                v["update_time"] = current_time
 
-            self._data.update(data)
-            await set_all_update_flags(self.final_namespace)
+            v["_id"] = k
+
+        self._data.update(data)
+        await set_all_update_flags(self.final_namespace)
 
     async def delete(self, ids: list[str]) -> None:
-        """Delete specific records from storage by their IDs
-
-        Importance notes for in-memory storage:
-        1. Changes will be persisted to disk during the next index_done_callback
-        2. update flags to notify other processes that data persistence is needed
-
-        Args:
-            ids (list[str]): List of document IDs to be deleted from storage
-
-        Returns:
-            None
-        """
         async with self._storage_lock:
-            any_deleted = False
-            for doc_id in ids:
-                result = self._data.pop(doc_id, None)
-                if result is not None:
-                    any_deleted = True
+            await self._delete_no_lock(ids)
 
-            if any_deleted:
-                await set_all_update_flags(self.final_namespace)
+    async def _delete_no_lock(self, ids: list[str]) -> None:
+        any_deleted = False
+        for doc_id in ids:
+            result = self._data.pop(doc_id, None)
+            if result is not None:
+                any_deleted = True
+
+        if any_deleted:
+            await set_all_update_flags(self.final_namespace)
 
     async def drop(self) -> dict[str, str]:
         """Drop all data from storage and clean up resources
@@ -326,3 +319,73 @@ class JsonKVStorage(BaseKVStorage):
 
         # Reset init flag so next initialize loads from disk
         await reset_namespace_initialization(self.final_namespace)
+
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        """
+        Context manager for atomic read-modify-write operations.
+        Acquires an exclusive lock on the storage file, ensuring isolation.
+        Yields a wrapper that allows lock-free access to storage methods to prevent deadlocks.
+        """
+        if self._storage_lock is None:
+            raise StorageNotInitializedError("JsonKVStorage")
+
+        lock_file = self._file_name + ".lock"
+        start_time = time.time()
+
+        # Acquire asyncio lock to coordinate with local tasks
+        async with self._storage_lock:
+            # Acquire file lock to coordinate with other processes
+            with open(lock_file, "w+") as fd:
+                async with self._file_lock(fd, fcntl.LOCK_EX, lock_file):
+                    # 1. Reload from disk
+                    disk_data = load_json(self._file_name) or {}
+
+                    # 2. Merge logic using timestamps (Same as index_done_callback)
+                    for k, v in self._data.items():
+                        if k in disk_data:
+                            disk_v = disk_data[k]
+                            if isinstance(disk_v, dict) and isinstance(v, dict):
+                                disk_time = disk_v.get("update_time", 0)
+                                my_time = v.get("update_time", 0)
+                                if my_time >= disk_time:
+                                    disk_data[k] = v
+                            else:
+                                disk_data[k] = v
+                        else:
+                            disk_data[k] = v
+
+                    self._data = disk_data
+
+                    # Yield wrapper that bypasses lock
+                    yield self._TransactionWrapper(self)
+
+                    # 3. Persist changes
+                    write_json(self._data, self._file_name)
+                    await clear_all_update_flags(self.final_namespace)
+
+        # Record transaction stats
+        end_time = time.time()
+        self._update_tx_stats(end_time - start_time, self._file_name)
+
+    class _TransactionWrapper:
+        def __init__(self, storage):
+            self._storage = storage
+
+        def __getattr__(self, name):
+            return getattr(self._storage, name)
+
+        async def get_by_id(self, id: str) -> dict[str, Any] | None:
+            return await self._storage._get_by_id_no_lock(id)
+
+        async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
+            return await self._storage._get_by_ids_no_lock(ids)
+
+        async def get_all(self) -> dict[str, Any]:
+            return await self._storage._get_all_no_lock()
+
+        async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
+            return await self._storage._upsert_no_lock(data)
+
+        async def delete(self, ids: list[str]) -> None:
+            return await self._storage._delete_no_lock(ids)
