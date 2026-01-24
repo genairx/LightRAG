@@ -35,7 +35,14 @@ class NetworkXStorage(BaseGraphStorage):
         logger.info(
             f"[{workspace}] Writing graph with {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges"
         )
-        nx.write_graphml(graph, file_name)
+        tmp_file_name = file_name + ".tmp"
+        try:
+            nx.write_graphml(graph, tmp_file_name)
+            os.replace(tmp_file_name, file_name)
+        except Exception as e:
+            if os.path.exists(tmp_file_name):
+                os.remove(tmp_file_name)
+            raise e
 
     def __post_init__(self):
         working_dir = self.global_config["working_dir"]
