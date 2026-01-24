@@ -1,5 +1,4 @@
 import os
-import json
 import fcntl
 from dataclasses import dataclass
 from typing import Any, final
@@ -60,17 +59,7 @@ class JsonKVStorage(BaseKVStorage):
             need_init = await try_initialize_namespace(self.final_namespace)
             self._data = await get_namespace_data(self.final_namespace)
             if need_init:
-                # loaded_data = load_json(self._file_name) or {}
-                if os.path.exists(self._file_name):
-                    with open(self._file_name, "r", encoding="utf-8-sig") as f:
-                        fcntl.flock(f, fcntl.LOCK_SH)
-                        try:
-                            loaded_data = json.load(f)
-                        finally:
-                            fcntl.flock(f, fcntl.LOCK_UN)
-                else:
-                    loaded_data = {}
-
+                loaded_data = load_json(self._file_name) or {}
                 async with self._storage_lock:
                     # Migrate legacy cache structure if needed
                     if self.namespace.endswith("_cache"):
